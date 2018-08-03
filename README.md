@@ -1,4 +1,4 @@
-# island v1.5
+# island.js
 
 An opinionated, full-stacked Microservices framework for [node](http://nodejs.org), powered by [TypeScript](https://github.com/microsoft/typescript).
 
@@ -41,23 +41,10 @@ island.Islet.run(HawaiiIslet);
 ```
 
 
-## Table of Contents
-
-  - [Installation](#installation)
-  - [Features](#features)
-  - [v1.0](#v1.0)
-  - [Building](#building)
-  - [Tests](#tests)
-  - [Environment Variables](#environment+variables)
-  - [Milestones](#milestones)
-  - [People](#people)
-  - [License](#license)
-
-
 ## Installation
 
 ```
-$ npm install island --save
+$ npm i island
 ```
 
 
@@ -72,32 +59,6 @@ $ npm install island --save
   - Track communications per each request
   - Chain contexts with UUID per each request
 
-## v1.2
- 
-### Changes
-
-  - Support to expand langid from property name for @validate @sanitize [#69](https://github.com/spearhead-ea/island/issues/68)
-  - Fix singleton bug [#64](https://github.com/spearhead-ea/island/pull/67)
-
-## v1.0
-
-### Changes
-
-  - `Loggers` is no longer a part of `island` -> [island-loggers](https://github.com/spearhead-ea/island-loggers) [#14](https://github.com/spearhead-ea/island/issues/14)
-  - `Di` is no longer a part of `island` -> [island-di](https://github.com/spearhead-ea/island-di) [#16](https://github.com/spearhead-ea/island/issues/16)
-  - `@endpoint` decorator now provides 4 more methods [#28](https://github.com/spearhead-ea/island/issues/28)
-    - `@endpoint('GET /test')` still works
-    - `@endpoint.get('/test')` - You can omit the GET method
-    - `@endpoint.post('/test')` - You can omit the POST method
-    - `@endpoint.put('/test')` - You can omit the PUT method
-    - `@endpoint.del('/test')` - You can omit the DEL method
-
-
-### Breaking Changes
-
-  - Require TypeScript@2.x
-    - `strictNullChecks`
-
 
 ## Building
 
@@ -105,21 +66,20 @@ In order to build the island, ensure that you have [Git](http://git-scm.com/down
 
 Clone a copy of the repo:
 
-```
+```bash
 $ git clone https://github.com/spearhead-ea/island.git
 ```
 
 Change to the island directory:
 
-```
+```bash
 $ cd island
 ```
 
-Install prerequisites and dev dependencies:
+Install dependencies and dev dependencies:
 
-```
-$ npm install -g gulp typescript
-$ npm install
+```bash
+$ npm i
 ```
 
 
@@ -128,34 +88,62 @@ $ npm install
   To run the test suite, first install the dependencies, then run `npm test`:
 
 ```bash
-$ npm install
-$ RABBITMQ_HOST=localhost npm test
+$ npm i
+$ RABBITMQ_HOST=localhost npm t
 ```
 
 
 ## Environment Variables
 
-| Environment                  | Notes                                                             |
-| ---------------------------- | ----------------------------------------------------------------- |
-| `NODE_ENV`                   | When `development`, allows APIs which has options.developmentOnly |
-| `HOSTNAME`                   | TraceLog uses this as a name of node                              |
-| `ISLAND_RPC_EXEC_TIMEOUT_MS` | Timeout during execution (Defaults to 25000)                      |
-| `ISLAND_RPC_WAIT_TIMEOUT_MS` | Timeout during call (Defaults to 60000)                           |
-| `ISLAND_SERVICE_LOAD_TIME_MS`| Time to load service (Defaults to 60000)                          |
-| `ISLAND_LOGGER_LEVEL`        | Logger level of category `island`                                 |
-| `ISLAND_IGNORE_EVENT_LOG`    | Ignore the log for Event containing this Env (template is `A,B`)  |
-| `ISLAND_TRACEMQ_HOST`        | MQ(formatted by amqp URI) for TraceLog. If omitted it doesn't log |
-| `ISLAND_TRACEMQ_QUEUE`       | A queue name to log TraceLog                                      |
-| `SERIALIZE_FORMAT_PUSH`      | currently able Push format json and msgpack (Default to msgpack)  |
-| `STATUS_EXPORT`              | If it is `true`, use island-status-exporter (Defaults to false)   |
-| `STATUS_EXPORT_TIME_MS`      | Time to save file for instance status (Defaults to 10000)         |
-| `STATUS_FILE_NAME`           | island-status-exporter uses this as a name for file               |
-
-
-## Milestones
-
-For details on our planned features and future direction please refer to our [milestones](https://github.com/spearhead-ea/island/milestones)
-
+| Name                                    | Type    | Default                   | Notes                                                             | LegacyKeys                                                     |
+| --------------------------------------- | ------- | ------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------- |
+| ISLAND_SERVICE_NAME                     | String  | 'no-service-name'         |                                                                   | 'SERVICE_NAME'                                                 |
+| ISLAND_HOST_NAME                        | String  | 'no-host-name'            | TraceLog uses this as a name of node                              | 'HOSTNAME'                                                     |
+| ISLAND_USE_DEV_MODE                     | Boolean | false                     | When true, allows APIs which has options.developmentOnly          | 'USE_DEV_MODE'                                                 |
+| ISLAND_SERIALIZE_FORMAT_PUSH            | String  | 'msgpack'                 | currently able Push format json and msgpack                       | 'SERIALIZE_FORMAT_PUSH'                                        |
+| ISLAND_EVENT_PREFETCH                   | Number  | 100                       |                                                                   | 'EVENT_PREFETCH'                                               |
+| ISLAND_RPC_PREFETCH                     | Number  | 100                       | Count of RPC Prefetch                                             | 'RPC_PREFETCH'                                                 |
+| ISLAND_RPC_EXEC_TIMEOUT                 | String  | '25s'                     | Timeout during RPC execution                                      |                                                                |
+| ISLAND_RPC_EXEC_TIMEOUT_MS              | Number  | 0                         | deprecated                                                        |                                                                |
+| ISLAND_RPC_WAIT_TIMEOUT                 | String  | '60s'                     | Timeout during RPC call                                           |                                                                |
+| ISLAND_RPC_WAIT_TIMEOUT_MS              | Number  | 0                         | deprecated                                                        |                                                                |
+| ISLAND_SERVICE_LOAD_TIME                | String  | '60s'                     | Time to load service                                              |                                                                |
+| ISLAND_SERVICE_LOAD_TIME_MS             | Number  | 0                         | deprecated                                                        |                                                                |
+| ISLAND_LOGGER_LEVEL                     | String  | 'info'                    | Log level for logger                                              |                                                                |
+| ISLAND_LOGGER_TYPE                      | String  | 'short'                   |                                                                   |                                                                |
+| ISLAND_RPC_RES_NOACK                    | Boolean | false                     |                                                                   |                                                                |
+| ISLAND_NO_REVIVER                       | Boolean | false                     |                                                                   | 'NO_REVIVER'                                                   |
+| ISLAND_USE_REVIVER                      | Boolean | false                     |                                                                   | 'USE_REVIVER'                                                  |
+| ISLAND_STATUS_EXPORT                    | Boolean | false                     | If it is true, use island-status-exporter                         | 'STATUS_EXPORT'                                                |
+| ISLAND_STATUS_EXPORT_TIME               | String  | '10s'                     | Time to save file for instance status                             |                                                                |
+| ISLAND_STATUS_EXPORT_TIME_MS            | Number  | 0                         | deprecated                                                        | 'STATUS_EXPORT_TIME_MS'                                        |
+| ISLAND_STATUS_FILE_NAME                 | String  |                           | island-status-exporter uses this as a name for file               | 'STATUS_FILE_NAME'                                             |
+| ISLAND_STATUS_EXPORT_TYPE               | String  | 'FILE'                    | status-exporter uses this type for saving data                    | 'STATUS_EXPORT_TYPE'                                           |
+| ISLAND_TRACEMQ_HOST                     | String  |                           | MQ(formatted by amqp URI) for TraceLog. If omitted it doesn't log |                                                                |
+| ISLAND_TRACEMQ_QUEUE                    | String  | 'trace'                   | A queue name to log TraceLog                                      |                                                                |
+| ISLAND_TRACE_HEADER_LOG                 | Boolean | false                     | When true, add trace log to msg.header                            |                                                                |
+| ISLAND_ENDPOINT_SESSION_GROUP           | String  |                           |                                                                   | 'ENDPOINT_SESSION_GROUP'                                       |
+| ISLAND_CONSUL_HOST                      | String  | 'consul'                  | The address of consul.                                            | 'CONSUL_HOST'                                                  |
+| ISLAND_CONSUL_PORT                      | String  | '8500'                    | consul port. work with CONSUL_HOST                                | 'CONSUL_PORT'                                                  |
+| ISLAND_CONSUL_NAMESPACE                 | String  |                           |                                                                   | 'CONSUL_NAMESPACE'                                             |
+| ISLAND_CONSUL_TOKEN                     | String  |                           |                                                                   | 'CONSUL_TOKEN'                                                 |
+| ISLAND_RABBITMQ_HOST                    | String  | 'amqp://rabbitmq:5672'    | The address of rabbitmq.                                          | 'RABBITMQ_HOST'                                                |
+| ISLAND_RABBITMQ_PUSH_HOST               | String  |                           |                                                                   | 'RABBITMQ_PUSH_HOST', 'ISLAND_RABBITMQ_HOST', 'RABBITMQ_HOST'  |
+| ISLAND_RABBITMQ_RPC_HOST                | String  |                           |                                                                   | 'RABBITMQ_RPC_HOST', 'ISLAND_RABBITMQ_HOST', 'RABBITMQ_HOST'   |
+| ISLAND_RABBITMQ_EVENT_HOST              | String  |                           |                                                                   | 'RABBITMQ_EVENT_HOST', 'ISLAND_RABBITMQ_HOST', 'RABBITMQ_HOST' |
+| ISLAND_RABBITMQ_POOLSIZE                | Number  | 100                       |                                                                   | 'RABBITMQ_POOLSIZE'                                            |
+| ISLAND_REDIS_AUTH                       | String  |                           |                                                                   | 'REDIS_AUTH'                                                   |
+| ISLAND_REDIS_HOST                       | String  | 'redis'                   | The address of redishost.                                         | 'REDIS_HOST'                                                   |
+| ISLAND_REDIS_PORT                       | Number  | 6379                      |                                                                   | 'REDIS_PORT'                                                   |
+| ISLAND_MONGO_HOST                       | String  | 'mongodb://mongodb:27017' |                                                                   | 'MONGO_HOST'                                                   |
+| ISLAND_RPC_DISTRIB_SIZE                 | Number  | 16                        |                                                                   |                                                                |
+| ISLAND_USE_CIRCUIT_BREAK                | Boolean | false                     |                                                                   |                                                                |
+| ISLAND_CIRCUIT_BREAK_TIME               | String  | '1m'                      |                                                                   |                                                                |
+| ISLAND_CIRCUIT_BREAK_TIME_MS            | Number  | 0                         | deprecated                                                        |                                                                |
+| ISLAND_CIRCUIT_BREAK_FAILRATE_THRESHOLD | Number  | 0.2                       |                                                                   |                                                                |
+| ISLAND_CIRCUIT_BREAK_REQUEST_THRESHOLD  | Number  | 10                        |                                                                   |                                                                |
+| ISLAND_FLOWMODE_DELAY_TIME              | String  | '10s'                     |                                                                   |                                                                |
+| ISLAND_FLOWMODE_DELAY                   | Number  | 0                         | deprecated                                                        |                                                                |
 
 
 ## People
@@ -190,3 +178,74 @@ The current lead maintainer is [Kei Son](https://github.com/heycalmdown)
 lalalala
 hahahaha
 halahala
+
+## Error Codes
+
+### ErrorLevel
+```javascript
+
+  EXPECTED  = 1,
+  LOGIC     = 2,
+  FATAL     = 3,
+  RESERVED4 = 4,
+  RESERVED5 = 5,
+  RESERVED6 = 6,
+  RESERVED7 = 7,
+  RESERVED8 = 8,
+  ETC       = 9
+```
+### IslandLevel
+```javascript
+
+  ISLAND    = 0,
+  ISLANDJS  = 1,
+  UNKNOWN   = 2,
+  RESERVED3 = 3,
+  RESERVED4 = 4,
+  RESERVED5 = 5,
+  RESERVED6 = 6,
+  RESERVED7 = 7,
+  RESERVED8 = 8,
+  RESERVED9 = 9
+```
+### EXPECTED
+```javascript
+
+    E0001_UNKNOWN = 1
+```
+### LOGIC
+```javascript
+
+    L0001_PLAYER_NOT_EXIST = 1,
+    L0002_WRONG_PARAMETER_SCHEMA = 2,
+    L0003_NOT_INITIALIZED_EXCEPTION = 3,
+    L0004_MSG_PACK_ERROR = 4,
+    L0005_MSG_PACK_ENCODE_ERROR = 5,
+    L0006_HANDLE_MESSAGE_ERROR = 6,
+    L0007_PUSH_ENCODE_ERROR = 7
+```
+### FATAL
+```javascript
+
+    F0001_ISLET_ALREADY_HAS_BEEN_REGISTERED   = 1,
+    F0002_DUPLICATED_ADAPTER                  = 2,
+    F0003_MISSING_ADAPTER                     = 3,
+    F0004_NOT_IMPLEMENTED_ERROR               = 4,
+    F0008_AMQP_CHANNEL_POOL_REQUIRED          = 8,
+    F0011_NOT_INITIALIZED_EXCEPTION           = 11,
+    F0012_ROUND_ROBIN_EVENT_Q_IS_NOT_DEFINED  = 12,
+    F0013_NOT_INITIALIZED                     = 13,
+    F0015_TAG_IS_UNDEFINED                    = 15,
+    F0016_SCOPE_CONTEXT_ERROR                 = 16,
+    F0018_ERROR_COLLECTING_META_DATA          = 18,
+    F0019_NOT_IMPLEMENTED_ERROR               = 19,
+    F0020_NOT_INITIALIZED_EXCEPTION           = 20,
+    F0021_NOT_IMPLEMENTED_ERROR               = 21,
+    F0022_NOT_INITIALIZED_EXCEPTION           = 22,
+    F0023_RPC_TIMEOUT                         = 23,
+    F0024_ENDPOINT_METHOD_REDECLARED          = 24,
+    F0025_MISSING_ADAPTER_OPTIONS             = 25,
+    F0026_MISSING_REPLYTO_IN_RPC              = 26,
+    F0027_CONSUMER_IS_CANCELED                = 27,
+    F0028_CONSUL_ERROR                        = 28
+```

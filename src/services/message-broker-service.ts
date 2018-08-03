@@ -1,5 +1,6 @@
 import * as amqp from 'amqplib';
 import * as Bluebird from 'bluebird';
+import deprecated from 'deprecated-decorator';
 import * as _ from 'lodash';
 import * as uuid from 'uuid';
 
@@ -8,6 +9,7 @@ import { logger } from '../utils/logger';
 import reviver from '../utils/reviver';
 import AbstractBrokerService, { IConsumerInfo } from './abstract-broker-service';
 
+@deprecated()
 export default class MessageBrokerService extends AbstractBrokerService {
   private static EXCHANGE_NAME: string = 'MESSAGE_BROKER_EXCHANGE';
   private roundRobinEventQ: string;
@@ -56,7 +58,7 @@ export default class MessageBrokerService extends AbstractBrokerService {
     await this.checkInitialized();
     await this.unbindQueue(this.roundRobinEventQ, MessageBrokerService.EXCHANGE_NAME, pattern);
 
-    delete this.handlers[pattern];
+    this.handlers = _.omit(this.handlers, pattern);
   }
 
   async subscribeFanout(pattern: string, handler?: Handler): Promise<void> {
@@ -70,7 +72,7 @@ export default class MessageBrokerService extends AbstractBrokerService {
     await this.checkInitialized();
     await this.unbindQueue(this.fanoutEventQ, MessageBrokerService.EXCHANGE_NAME, pattern);
 
-    delete this.handlers[pattern];
+    this.handlers = _.omit(this.handlers, pattern);
   }
 
   async publish<T>(key: string, msg: T): Promise<void> {

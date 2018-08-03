@@ -1,23 +1,21 @@
 // tslint:disable-next-line
 require('source-map-support').install();
-process.env.ISLAND_RPC_EXEC_TIMEOUT_MS = '1000';
-process.env.ISLAND_RPC_WAIT_TIMEOUT_MS = '3000';
-process.env.ISLAND_SERVICE_LOAD_TIME_MS = '1000';
-process.env.STATUS_EXPORT = 'true';
-process.env.STATUS_EXPORT_TIME_MS = '3000';
 
 import * as Bluebird from 'bluebird';
-// import * as fs from 'fs';
+import { StatusExporter } from 'island-status-exporter';
+import * as _ from 'lodash';
 
-import { RpcOptions } from '../controllers/rpc-decorator';
 import paramSchemaInspector from '../middleware/schema.middleware';
 import { AmqpChannelPoolService } from '../services/amqp-channel-pool-service';
-import RPCService, { RpcHookType, RpcRequest, RpcResponse } from '../services/rpc-service';
+import { RpcHookType, RpcRequest, RpcResponse, RPCService } from '../services/rpc-service';
+import { Environments } from '../utils/environments';
 import { AbstractEtcError, AbstractFatalError, AbstractLogicError, FatalError, ISLAND } from '../utils/error';
 import { jasmineAsyncAdapter as spec } from '../utils/jasmine-async-support';
 import { logger } from '../utils/logger';
-// import { collector } from '../utils/status-collector';
-import { TraceLog } from '../utils/tracelog';
+import { RpcOptions } from '../utils/rpc-request';
+import { collector } from '../utils/status-collector';
+
+Environments.refreshEnvForDebug();
 
 // tslint:disable-next-line no-var-requires
 const stdMocks = require('std-mocks');
@@ -46,6 +44,28 @@ describe('RpcResponse', () => {
 describe('RPC(isolated test)', () => {
   const rpcService = new RPCService('haha');
   const amqpChannelPool = new AmqpChannelPoolService();
+  const ISLAND_RPC_EXEC_TIMEOUT_MS = Environments.ISLAND_RPC_EXEC_TIMEOUT_MS;
+  const ISLAND_RPC_WAIT_TIMEOUT_MS = Environments.ISLAND_RPC_WAIT_TIMEOUT_MS;
+  const ISLAND_SERVICE_LOAD_TIME_MS  = Environments.ISLAND_SERVICE_LOAD_TIME_MS;
+  const ISLAND_STATUS_EXPORT = Environments.ISLAND_STATUS_EXPORT;
+  const ISLAND_STATUS_EXPORT_TIME_MS = Environments.ISLAND_STATUS_EXPORT_TIME_MS;
+
+  beforeAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = 1000;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = 3000;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = 1000;
+    Environments.ISLAND_STATUS_EXPORT = true;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = 3000;
+  }));
+
+  afterAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = ISLAND_RPC_EXEC_TIMEOUT_MS;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = ISLAND_RPC_WAIT_TIMEOUT_MS;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = ISLAND_SERVICE_LOAD_TIME_MS;
+    Environments.ISLAND_STATUS_EXPORT = ISLAND_STATUS_EXPORT;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = ISLAND_STATUS_EXPORT_TIME_MS;
+  }));
+
   beforeEach(spec(async () => {
     const url = process.env.RABBITMQ_HOST || 'amqp://rabbitmq:5672';
     await amqpChannelPool.initialize({ url });
@@ -56,7 +76,6 @@ describe('RPC(isolated test)', () => {
     await rpcService.purge();
     await Bluebird.delay(100); // to have time to send ack
     await amqpChannelPool.purge();
-    await TraceLog.purge();
   }));
 
   it('rpc test #1: rpc call', spec(async () => {
@@ -218,7 +237,6 @@ describe('RPC(isolated test)', () => {
     await rpcService.listen();
     await rpcService.purge();
     await amqpChannelPool.purge();
-    await TraceLog.purge();
 
     const url = process.env.RABBITMQ_HOST || 'amqp://rabbitmq:5672';
     await amqpChannelPool.initialize({ url });
@@ -445,9 +463,74 @@ describe('RPC(isolated test)', () => {
     const res = await p;
     expect(res).toBe('hello world');
   }));
+
+  it('should response as a flow when it got a delayed message', spec(async () => {
+    const r = rpcService as any;
+    const _consume = r._consume;
+    const _reply = r._reply;
+    // tslint:disable-next-line
+    r._consume = function (key, handler, noAck): any {
+      return _consume.call(this, key, msg => {
+        msg.properties.timestamp = +new Date() - 1000;
+        return handler(msg);
+      }, noAck);
+    };
+    // tslint:disable-next-line
+    r._reply = function (replyTo, value, options) {
+      expect(options.headers.properties.extra.flow).toBe(true);
+      return _reply.call(this, replyTo, value, options);
+    };
+
+    await rpcService.register('testTest', async msg => msg, 'rpc');
+    await rpcService.listen();
+    await rpcService.invoke<string, string>('testTest', 'hi');
+  }));
+
+  it('should not use the queue which have got flow', spec(async () => {
+    const r = rpcService as any;
+    const _consume = r._consume;
+    // tslint:disable-next-line
+    r._consume = function (key, handler, noAck): any {
+      return _consume.call(this, key, msg => {
+        msg.properties.timestamp = +new Date() - 1000;
+        return handler(msg);
+      }, noAck);
+    };
+
+    await rpcService.register('testTest', async msg => msg, 'rpc');
+    await rpcService.listen();
+    await rpcService.invoke<string, string>('testTest', 'hi');
+
+    const now = +new Date();
+    const routingKey = _.findIndex(r.queuesAvailableSince, d => now < d);
+    const frequency = _.countBy(_.range(1000).map(o => r.makeRoutingKey()));
+    expect(frequency[routingKey]).not.toBeDefined();
+  }));
 });
 
-describe('RPC with reviver', async () => {
+describe('RPC excluded reviver', async () => {
+  const ISLAND_RPC_EXEC_TIMEOUT_MS = Environments.ISLAND_RPC_EXEC_TIMEOUT_MS;
+  const ISLAND_RPC_WAIT_TIMEOUT_MS = Environments.ISLAND_RPC_WAIT_TIMEOUT_MS;
+  const ISLAND_SERVICE_LOAD_TIME_MS = Environments.ISLAND_SERVICE_LOAD_TIME_MS;
+  const ISLAND_STATUS_EXPORT = Environments.ISLAND_STATUS_EXPORT;
+  const ISLAND_STATUS_EXPORT_TIME_MS = Environments.ISLAND_STATUS_EXPORT_TIME_MS;
+
+  beforeAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = 1000;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = 3000;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = 1000;
+    Environments.ISLAND_STATUS_EXPORT = true;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = 3000;
+  }));
+
+  afterAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = ISLAND_RPC_EXEC_TIMEOUT_MS;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = ISLAND_RPC_WAIT_TIMEOUT_MS;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = ISLAND_SERVICE_LOAD_TIME_MS;
+    Environments.ISLAND_STATUS_EXPORT = ISLAND_STATUS_EXPORT;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = ISLAND_STATUS_EXPORT_TIME_MS;
+  }));
+
   const url = process.env.RABBITMQ_HOST || 'amqp://rabbitmq:5672';
   const rpcService = new RPCService('haha');
   const amqpChannelPool = new AmqpChannelPoolService();
@@ -465,25 +548,52 @@ describe('RPC with reviver', async () => {
 
   afterEach(spec(async () => {
     await Bluebird.delay(100);
-    await TraceLog.purge();
     await rpcService.purge();
     await amqpChannelPool.purge();
   }));
 
-  it('should convert an ISODate string to Date', spec(async () => {
-    const res = await invokeTest();
-    expect(typeof res).toEqual('object');
-    expect(res instanceof Date).toBeTruthy();
-  }));
-
-  it('should keep an ISODate string as string with noReviver', spec(async () => {
-    const res = await invokeTest({ noReviver: true });
+  it('should keep an ISODate string as string', spec(async () => {
+    const res = await invokeTest({});
     expect(typeof res).toEqual('string');
     expect(res instanceof Date).toBeFalsy();
+  }));
+
+  it('should keep an ISODate string as string without reviver', spec(async () => {
+    const res = await invokeTest({ useReviver: false });
+    expect(typeof res).toEqual('string');
+    expect(res instanceof Date).toBeFalsy();
+  }));
+
+  it('should convert an ISODate string to Date with reviver', spec(async () => {
+    const res = await invokeTest({ useReviver: true });
+    expect(typeof res).toEqual('object');
+    expect(res instanceof Date).toBeTruthy();
   }));
 });
 
 describe('RPC-hook', () => {
+  const ISLAND_RPC_EXEC_TIMEOUT_MS = Environments.ISLAND_RPC_EXEC_TIMEOUT_MS;
+  const ISLAND_RPC_WAIT_TIMEOUT_MS = Environments.ISLAND_RPC_WAIT_TIMEOUT_MS;
+  const ISLAND_SERVICE_LOAD_TIME_MS  = Environments.ISLAND_SERVICE_LOAD_TIME_MS;
+  const ISLAND_STATUS_EXPORT = Environments.ISLAND_STATUS_EXPORT;
+  const ISLAND_STATUS_EXPORT_TIME_MS = Environments.ISLAND_STATUS_EXPORT_TIME_MS;
+
+  beforeAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = 1000;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = 3000;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = 1000;
+    Environments.ISLAND_STATUS_EXPORT = true;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = 3000;
+  }));
+
+  afterAll(spec(async () => {
+    Environments.ISLAND_RPC_EXEC_TIMEOUT_MS = ISLAND_RPC_EXEC_TIMEOUT_MS;
+    Environments.ISLAND_RPC_WAIT_TIMEOUT_MS = ISLAND_RPC_WAIT_TIMEOUT_MS;
+    Environments.ISLAND_SERVICE_LOAD_TIME_MS = ISLAND_SERVICE_LOAD_TIME_MS;
+    Environments.ISLAND_STATUS_EXPORT = ISLAND_STATUS_EXPORT;
+    Environments.ISLAND_STATUS_EXPORT_TIME_MS = ISLAND_STATUS_EXPORT_TIME_MS;
+  }));
+
   const url = process.env.RABBITMQ_HOST || 'amqp://rabbitmq:5672';
   const rpcService = new RPCService('haha');
   const amqpChannelPool = new AmqpChannelPoolService();
@@ -495,7 +605,6 @@ describe('RPC-hook', () => {
 
   afterEach(spec(async () => {
     await Bluebird.delay(100);
-    await TraceLog.purge();
     await rpcService.purge();
     await amqpChannelPool.purge();
   }));
@@ -597,14 +706,10 @@ describe('RPC-hook', () => {
     }
   }));
 
-  // it('should specify filename and instanceId', spec(async () => {
-  //   const fileName = collector.initialize({ name: 'rpc', hostname: 'test' });
-  //   await collector.saveStatusJsonFile();
-  //   const file = await fs.readFileSync(fileName, 'utf8');
-  //   const json = JSON.parse(file);
-  //   await fs.unlinkSync(fileName);
-  //   expect(json.instanceId).toBeDefined('test');
-  // }));
+  it('should save status file', spec(async () => {
+    StatusExporter.initialize({name: 'status_collect'});
+    await collector.saveStatus();
+  }));
 
   it('could check the onGoingRequest', spec(async () => {
     rpcService.registerHook(RpcHookType.PRE_RPC, content => Promise.resolve('hi, ' + content));

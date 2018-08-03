@@ -1,8 +1,7 @@
 import * as Bluebird from 'bluebird';
 
-import { SubscriptionOptions } from '../services/event-service';
-import { Event, EventHandler } from '../services/event-subscriber';
-import { DEFAULT_SUBSCRIPTIONS, EventSubscription } from '../utils/event';
+import { Event, EventHandler, SubscriptionOptions } from '../services/event-subscriber';
+import { EventSubscription } from '../utils/event';
 import AbstractController from './abstract-controller';
 
 interface PatternSubscription {
@@ -25,10 +24,9 @@ export function eventController<T>(target: any) {
   target.prototype.onInitialized = async function () {
     const result = await _onInitialized.apply(this);
 
-    const constructor = target as {new (): AbstractController<T>;} &
+    const constructor = target as {new (): AbstractController<T>} &
       EventSubscriptionContainer<Event<any>, any> & PatternSubscriptionContainer;
 
-    constructor._eventSubscriptions = DEFAULT_SUBSCRIPTIONS.concat(constructor._eventSubscriptions || []);
     return Bluebird.map(constructor._eventSubscriptions || [], ({eventClass, handler, options}) => {
         return this.server.subscribeEvent(eventClass, handler.bind(this), options);
       })
@@ -53,6 +51,7 @@ export function subscribeEvent<T extends Event<U>, U>(eventClass: new (args: U) 
 
 export function subscribePattern(pattern: string, options?: SubscriptionOptions) {
   return (target: any, propertyKey: string, desc: PropertyDescriptor) => {
+    pattern = pattern.trim();
     const constructor = target.constructor as Function & PatternSubscriptionContainer;
     constructor._patternSubscriptions = constructor._patternSubscriptions || [];
     constructor._patternSubscriptions.push({

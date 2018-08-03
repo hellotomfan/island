@@ -1,6 +1,6 @@
-import { RpcRequest } from '../services/rpc-service';
 import { ISLAND, LogicError } from '../utils/error';
 import { logger } from '../utils/logger';
+import { RpcRequest } from '../utils/rpc-request';
 import translateSchemaType from './schema-types';
 
 import inspector = require('schema-inspector');
@@ -9,7 +9,7 @@ export function sanitize(subschema, target) {
   if (!subschema) return target;
   translateSchemaType(subschema);
   const result = inspector.sanitize(subschema, target);
-  logger.debug('sanitized: %o', result.data);
+  logger.debug(`sanitized: ${result.data}`);
   return result.data;
 }
 

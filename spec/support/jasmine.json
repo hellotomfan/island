@@ -4,7 +4,8 @@
     "**/*[sS]pec.js"
   ],
   "helpers": [
-    "helpers/**/*.js"
-  ]
+    "../../spec/helpers/**/*.js"
+  ],
+  "random": false
 }
 
