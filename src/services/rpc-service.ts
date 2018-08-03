@@ -1,34 +1,26 @@
-// cls should be placed on top
-import * as cls from 'continuation-local-storage';
+import { cls } from 'island-loggers';
 
 import * as amqp from 'amqplib';
 import * as Bluebird from 'bluebird';
 import deprecated from 'deprecated-decorator';
+import * as fs from 'fs';
 import * as _ from 'lodash';
 import * as os from 'os';
 import uuid = require('uuid');
 
-import { RpcOptions } from '../controllers/rpc-decorator';
 import { sanitize, validate } from '../middleware/schema.middleware';
+import { DiagRpcArgs } from '../utils/diag';
 import { Environments } from '../utils/environments';
 import { AbstractError, FatalError, ISLAND, LogicError, mergeIslandJsError } from '../utils/error';
 import { logger } from '../utils/logger';
 import reviver from '../utils/reviver';
-import { RpcRequest } from '../utils/rpc-request';
+import { RouteLogger } from '../utils/route-logger';
+import { RpcOptions, RpcRequest } from '../utils/rpc-request';
 import { IRpcResponse, RpcResponse } from '../utils/rpc-response';
 import { collector } from '../utils/status-collector';
 import { AmqpChannelPoolService } from './amqp-channel-pool-service';
 
 export { IRpcResponse, RpcRequest, RpcResponse };
-
-const RPC_EXEC_TIMEOUT_MS = Environments.getIslandRpcExecTimeoutMs();
-const RPC_WAIT_TIMEOUT_MS = Environments.getIslandRpcWaitTimeoutMs();
-const SERVICE_LOAD_TIME_MS = Environments.getIslandServiceLoadTimeMs();
-const RPC_RES_NOACK = Environments.isIslandRpcResNoack();
-const RPC_QUEUE_EXPIRES_MS = RPC_WAIT_TIMEOUT_MS + SERVICE_LOAD_TIME_MS;
-const NO_REVIVER = Environments.isNoReviver();
-const USE_TRACE_HEADER_LOG = Environments.isUsingTraceHeaderLog();
-const RPC_QUEUE_DISTRIB_SIZE = 16;
 
 export type RpcType = 'rpc' | 'endpoint';
 export interface IConsumerInfo {
@@ -67,7 +59,7 @@ export interface RpcEntities {
 }
 
 export interface InitializeOptions {
-  noReviver?: boolean;
+  useReviver?: boolean;
   consumerAmqpChannelPool?: AmqpChannelPoolService;
 }
 
@@ -102,7 +94,12 @@ function nackWithDelay(channel, msg) {
 
 type DeferredResponse = { resolve: (msg: Message) => any, reject: (e: Error) => any };
 
-export default class RPCService {
+interface SystemDiagnosisPayload {
+ fileName: string;
+  cmd: string;
+  args: DiagRpcArgs;
+}
+export class RPCService {
   private requestConsumerInfo: IConsumerInfo[] = [];
   private responseQueueName: string;
   private waitingResponse: { [corrId: string]: DeferredResponse } = {};
@@ -112,22 +109,22 @@ export default class RPCService {
   private consumerChannelPool: AmqpChannelPoolService;
   private serviceName: string;
   private hooks: { [key: string]: RpcHook[] };
-  private onGoingRequest: {
-      count: number, details: Map<string, number>
-    } = { count : 0, details : new Map() };
   private purging: Function | null = null;
   private rpcEntities: RpcEntities = {};
+  private queuesAvailableSince: number[] = _.range(Environments.getRpcDistribSize()).map(o => +new Date());
 
   constructor(serviceName?: string) {
     this.serviceName = serviceName || 'unknown';
     this.hooks = {};
+    this.responseQueueName = this.makeResponseQueueName();
+    fs.writeFileSync('./rpc.proc', JSON.stringify({ status: 'initializing', queue: this.responseQueueName }));
   }
 
   public async initialize(channelPool: AmqpChannelPoolService, opts?: InitializeOptions): Promise<any> {
-    if (NO_REVIVER || opts && opts.noReviver) {
-      RpcResponse.reviver = undefined;
-    } else {
+    if (Environments.ISLAND_USE_REVIVER || opts && opts.useReviver) {
       RpcResponse.reviver = reviver;
+    } else {
+      RpcResponse.reviver = undefined;
     }
     if (opts && opts.consumerAmqpChannelPool) {
       this.consumerChannelPool = opts.consumerAmqpChannelPool;
@@ -135,17 +132,19 @@ export default class RPCService {
     } else {
       this.consumerChannelPool = channelPool;
     }
-    this.responseQueueName = this.makeResponseQueueName();
     logger.info(`consuming ${this.responseQueueName}`);
 
     this.channelPool = channelPool;
     await this.consumerChannelPool.usingChannel(
       channel => channel.assertQueue(this.responseQueueName, {
-        durable: false, exclusive: true, expires: RPC_QUEUE_EXPIRES_MS
+        durable: false,
+        exclusive: true,
+        expires: Environments.ISLAND_RPC_WAIT_TIMEOUT_MS + Environments.ISLAND_SERVICE_LOAD_TIME_MS
       })
     );
 
     await this.consumeForResponse();
+    fs.writeFileSync('./rpc.proc', JSON.stringify({ status: 'initialized', queue: this.responseQueueName }));
   }
 
   @deprecated()
@@ -156,11 +155,12 @@ export default class RPCService {
   }
 
   public async purge() {
+    try { fs.unlinkSync('./rpc.proc'); } catch (_e) {}
     logger.info('stop serving');
     await this.unregisterAll();
 
     let precondition = Promise.resolve();
-    if (0 < this.onGoingRequest.count) {
+    if (0 < collector.getOnGoingRequestCount('rpc')) {
       precondition = new Promise<void>(res => this.purging = res);
     }
     await precondition;
@@ -168,14 +168,11 @@ export default class RPCService {
     this.hooks = {};
     this.timedOut = {};
     this.timedOutOrdered = [];
+    this.queuesAvailableSince = _.range(Environments.getRpcDistribSize()).map(o => +new Date());
   }
 
   public async sigInfo() {
-    logger.info(`RPC Service onGoingRequestCount : ${this.onGoingRequest.count}`);
-    this.onGoingRequest.details.forEach((v, k) => {
-      if (v < 1) return;
-      logger.info(`RPC Service ${k} : ${v}`);
-    });
+    return await collector.sigInfo('rpc');
   }
 
   public registerHook(type: RpcHookType, hook: RpcHook) {
@@ -191,11 +188,12 @@ export default class RPCService {
   }
 
   public async listen() {
-    const queues = _.map(_.range(RPC_QUEUE_DISTRIB_SIZE), no => (`rpc.req.${this.serviceName}.${no}`));
+    const queues = _.map(_.range(Environments.getRpcDistribSize()), no => (`rpc.req.${this.serviceName}.${no}`));
     await this.assertQueues(queues);
     await this.assertExchanges(this.rpcEntities);
     await this.bindQueuesToExchanges(queues, this.rpcEntities);
     await this.startConsumingQueues(queues);
+    fs.writeFileSync('./rpc.proc', JSON.stringify({ status: 'started', queue: this.responseQueueName }));
   }
 
   @deprecated()
@@ -238,18 +236,23 @@ export default class RPCService {
 
   public async invoke<T, U>(name: string, msg: T, opts?: {withRawdata: boolean}): Promise<U>;
   public async invoke(name: string, msg: any, opts?: {withRawdata: boolean}): Promise<any> {
-    const option = this.makeInvokeOption();
+    name = name.trim();
+    const routingKey = this.makeRoutingKey();
+    const option = this.makeInvokeOption(name);
     const p = this.waitResponse(option.correlationId!, (msg: Message) => {
-      const ns = cls.getNamespace('app');
-      if (msg.properties.headers.extra.mqstack) {
-        ns.set('mqstack', msg.properties.headers.extra.mqstack);
+      if (msg.properties && msg.properties.headers) {
+        RouteLogger.replaceLogs('app', msg.properties.headers.extra.routeLogs);
+      }
+      if (msg.properties.headers.extra.flow) {
+        logger.notice(`RPC(${name}) responses extra.flow by the queue.${routingKey}`);
+        this.queuesAvailableSince[routingKey] = +new Date() + Environments.getFlowModeDelay();
       }
       const res = RpcResponse.decode(msg.content);
       if (res.result === false) throw res.body;
       if (opts && opts.withRawdata) return { body: res.body, raw: msg.content };
       return res.body;
     })
-      .timeout(RPC_WAIT_TIMEOUT_MS)
+      .timeout(Environments.ISLAND_RPC_WAIT_TIMEOUT_MS)
       .catch(Bluebird.TimeoutError, () => this.throwTimeout(name, option.correlationId!))
       .catch(err => {
         err.tattoo = option.headers.tattoo;
@@ -258,11 +261,10 @@ export default class RPCService {
 
     const content = new Buffer(JSON.stringify(msg), 'utf8');
     try {
-      const routingKey = '' + _.random(0, RPC_QUEUE_DISTRIB_SIZE - 1);
       await this.channelPool.usingChannel(async chan => chan.publish(name, routingKey, content, option));
     } catch (e) {
       this.waitingResponse[option.correlationId!].reject(e);
-      delete this.waitingResponse[option.correlationId!];
+      this.waitingResponse = _.omit(this.waitingResponse, option.correlationId!);
     }
     return await p;
   }
@@ -297,20 +299,33 @@ export default class RPCService {
   }
 
   private throwTimeout(name, corrId: string) {
-    delete this.waitingResponse[corrId];
+    this.waitingResponse = _.omit(this.waitingResponse, corrId);
     this.timedOut[corrId] = name;
     this.timedOutOrdered.push(corrId);
     if (20 < this.timedOutOrdered.length) {
-      delete this.timedOut[this.timedOutOrdered.shift()!];
+      this.timedOut = _.omit(this.timedOut, this.timedOutOrdered.shift()!);
     }
     const err = new FatalError(ISLAND.FATAL.F0023_RPC_TIMEOUT,
-                               `RPC(${name}) does not return in ${RPC_WAIT_TIMEOUT_MS} ms`);
+                               `RPC(${name}) does not return in ${Environments.ISLAND_RPC_WAIT_TIMEOUT_MS} ms`);
     err.statusCode = 504;
     throw err;
   }
 
   private shutdown() {
     process.emit('SIGTERM');
+  }
+
+  private makeRoutingKey(): string {
+    const now = +new Date();
+    const routingKeys = _.keys(_.pickBy(this.queuesAvailableSince.map(d => d < now), Boolean));
+    if (routingKeys.length < Math.floor(Environments.getRpcDistribSize() * 0.4)) {
+      logger.warning(`Availability of RPC queues are under 40%`);
+      // We should send this request anyway
+      return _.sample(_.keys(this.queuesAvailableSince))!;
+    } else if (routingKeys.length < Math.floor(Environments.getRpcDistribSize() * 0.7)) {
+      logger.notice(`Availability of RPC queues are under 70%`);
+    }
+    return _.sample(routingKeys)!;
   }
 
   private makeResponseQueueName() {
@@ -330,10 +345,13 @@ export default class RPCService {
         logger.notice('Got a response with no correlationId');
         return;
       }
+      if (correlationId === 'system.diagnosis') {
+        return this.onSystemDiagnosis(msg);
+      }
       if (this.timedOut[correlationId]) {
         const name = this.timedOut[correlationId];
-        delete this.timedOut[correlationId];
-        _.pull(this.timedOutOrdered, correlationId);
+        this.timedOut = _.omit(this.timedOut, correlationId);
+        this.timedOutOrdered = _.pull(this.timedOutOrdered, correlationId);
 
         logger.warning(`Got a response of \`${name}\` after timed out - ${correlationId}`);
         return;
@@ -343,9 +361,58 @@ export default class RPCService {
         logger.notice(`Got an unknown response - ${correlationId}`);
         return;
       }
-      delete this.waitingResponse[correlationId];
+      this.waitingResponse = _.omit(this.waitingResponse, correlationId);
       return waiting.resolve(msg);
-    }, RPC_RES_NOACK);
+    }, Environments.ISLAND_RPC_RES_NOACK);
+  }
+
+  private async onSystemDiagnosis(msg: Message) {
+    const body: SystemDiagnosisPayload = JSON.parse(msg.content.toString());
+    const response = await this.dispatchDiagnosis(body);
+    response.timestamp = +new Date();
+    fs.appendFile(
+      body.fileName,
+      JSON.stringify({
+        timestamp: +new Date(),
+        message: JSON.stringify(response.message),
+        error: JSON.stringify(response.error) }),
+      err => {
+        err && console.error(err);
+      }
+    );
+  }
+
+  private async dispatchDiagnosis(body: SystemDiagnosisPayload):
+      Promise<{ timestamp?: number, message?: any, error?: any }> {
+    const subCommand = body.cmd.split(':')[1];
+    if (!subCommand) {
+      return this.onDiagnosisRpc(body);
+    }
+    switch (subCommand) {
+      case 'list':
+        return { message: this.rpcEntities };
+    }
+    return { message: '' };
+  }
+
+  private async onDiagnosisRpc(body: SystemDiagnosisPayload) {
+    const args = body.args;
+    try {
+      if (!this.rpcEntities[args.name!] && !_.get(args, 'opts.remote')) {
+        throw new Error('no such RPC - ' + args.name);
+      }
+      return {
+        message: await this.invoke(args.name!, args.query || {})
+      };
+    } catch (e) {
+      const error: any = {
+        message: e.message
+      };
+      if (_.get(args, 'opts.stack')) {
+        error.stack = e.stack;
+      }
+      return { error };
+    }
   }
 
   private waitResponse(corrId: string, handleResponse: (msg: Message) => any) {
@@ -353,39 +420,39 @@ export default class RPCService {
       this.waitingResponse[corrId] = { resolve, reject };
     }).then((msg: Message) => {
       const clsScoped = cls.getNamespace('app').bind((msg: Message) => {
-        delete this.waitingResponse[corrId];
+        this.waitingResponse = _.omit(this.waitingResponse, corrId);
         return handleResponse(msg);
       });
       return clsScoped(msg);
     });
   }
 
-  private makeInvokeOption(): amqp.Options.Publish {
-    const ns = cls.getNamespace('app');
-    const tattoo = ns.get('RequestTrackId');
-    const context = ns.get('Context');
-    const type = ns.get('Type');
-    const sessionType = ns.get('sessionType');
-    let mqstack = ns.get('mqstack');
-    if (USE_TRACE_HEADER_LOG || mqstack) {
-      mqstack = mqstack || [];
-      mqstack.push({ node: Environments.getHostName(), context, island: this.serviceName, type });
-    }
+  private makeInvokeOption(name: string): amqp.Options.Publish {
     const correlationId = uuid.v4();
-    const headers = {
-      tattoo,
-      from: { node: Environments.getHostName(), context, island: this.serviceName, type },
-      extra: {
-        sessionType,
-        mqstack
-      }
-    };
+    RouteLogger.saveLog({ clsNameSpace: 'app', context: name, type: 'req', protocol: 'RPC', correlationId });
     return {
       correlationId,
-      expiration: RPC_WAIT_TIMEOUT_MS,
-      headers,
+      expiration: Environments.ISLAND_RPC_WAIT_TIMEOUT_MS,
+      headers: this.makeInvokeHeader(),
       replyTo: this.responseQueueName,
       timestamp: +(new Date())
+    };
+  }
+
+  private makeInvokeHeader(): any {
+    const ns = cls.getNamespace('app');
+    return {
+      tattoo: ns.get('RequestTrackId'),
+      from: {
+        node: Environments.getHostName(),
+        context: ns.get('Context'),
+        island: this.serviceName,
+        type: ns.get('Type')
+      },
+      extra: {
+        sessionType: ns.get('sessionType'),
+        routeLogs: RouteLogger.getLogs('app')
+      }
     };
   }
 
@@ -417,21 +484,28 @@ export default class RPCService {
 
   // returns value again for convenience
   private async reply(replyTo: string, value: any, options: amqp.Options.Publish) {
-    const ns = cls.getNamespace('app');
-    const mqstack = ns.get('mqstack');
-    if (mqstack) {
-      mqstack.push({ node: Environments.getHostName(), replyto: replyTo, island: this.serviceName, type: 'rpc' });
-      if (options.headers && options.headers.extra) {
-        options.headers.extra.mqstack = mqstack;
-      }
-      if (USE_TRACE_HEADER_LOG) {
-        logger.debug(`TraceHeaderLog:\n${JSON.stringify(mqstack, null, 2)}`);
-      }
-    }
+    options.headers = this.makeReplyHeader(options);
     await this.channelPool.usingChannel(async channel => {
       return channel.sendToQueue(replyTo, RpcResponse.encode(value), options);
     });
     return value;
+  }
+
+  private makeReplyHeader(options: amqp.Options.Publish) {
+    if (options.headers && options.headers.extra) {
+      const ns = cls.getNamespace('app');
+      RouteLogger.saveLog({
+        clsNameSpace: 'app',
+        context: ns.get('Context'),
+        type: 'res',
+        protocol: 'RPC',
+        correlationId: options.correlationId || ''
+      });
+      RouteLogger.print('app');
+      options.headers.extra.routeLogs = RouteLogger.getLogs('app');
+    }
+
+    return options.headers;
   }
 
   // enter continuation-local-storage scope
@@ -464,16 +538,14 @@ export default class RPCService {
     return Bluebird.reduce(this.hooks[hookType], (value, hook) => hook(value), value);
   }
 
-  private increaseRequest(name: string, count: number) {
-    this.onGoingRequest.count += count;
-    const requestCount = (this.onGoingRequest.details.get(name) || 0) + count;
-    this.onGoingRequest.details.set(name, requestCount);
-  }
-
   private async assertQueues(queues: string[]): Promise<void> {
     await this.consumerChannelPool.usingChannel(async channel => {
       await Promise.all(_.map(queues, async (queue: string) => {
-        await channel.assertQueue(queue, { durable: false, expires: RPC_QUEUE_EXPIRES_MS });
+        await channel.assertQueue(queue,
+                                  { durable: false,
+                                    expires: Environments.ISLAND_RPC_WAIT_TIMEOUT_MS +
+                                             Environments.ISLAND_SERVICE_LOAD_TIME_MS
+                                  });
       }));
     });
   }
@@ -499,14 +571,22 @@ export default class RPCService {
 
   private async startConsumingQueues(queues: string[]): Promise<void> {
     await this.consumerChannelPool.usingChannel(async channel => {
-      await Bluebird.each(queues, async queue => {
-        const consumerInfo = await this.startConsumingQueue(queue);
+      await Bluebird.each(queues, async (queue, shard) => {
+        const consumerInfo = await this.startConsumingQueue(queue, shard);
         this.requestConsumerInfo.push(consumerInfo);
       });
     });
   }
 
-  private async startConsumingQueue(queue: string): Promise<IConsumerInfo> {
+  private determineFlowControl(shard: number, timestamp = 0, extra: any) {
+    const now = +new Date();
+    if (now - timestamp > 300) {
+      logger.notice(`RPC queue.${shard} behinds ${now - timestamp}ms by flow control`);
+      extra.flow = true;
+    }
+  }
+
+  private async startConsumingQueue(queue: string, shard: number): Promise<IConsumerInfo> {
     return this._consume(queue, async (msg: Message) => {
       const rpcName = msg.fields.exchange;
       if (!this.rpcEntities[rpcName]) {
@@ -514,31 +594,27 @@ export default class RPCService {
         return;
       }
       const { type, handler, rpcOptions } = this.rpcEntities[rpcName];
-      const { replyTo, headers, correlationId } = msg.properties;
-      if (!replyTo) throw ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC;
+      const { replyTo, headers, correlationId, timestamp } = msg.properties;
+      if (!replyTo) throw new FatalError(ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC);
 
       const tattoo = headers && headers.tattoo;
       const extra = headers && headers.extra || {};
-      if (USE_TRACE_HEADER_LOG && !extra.mqstack) {
-        extra.mqstack = [];
-      }
+      this.determineFlowControl(shard, timestamp, extra);
       return this.enterCLS(tattoo, rpcName, extra, async () => {
         const options = { correlationId, headers };
         const parsed = JSON.parse(msg.content.toString('utf8'), RpcResponse.reviver);
-        const requestId: string = collector.collectRequestAndReceivedTime(type, rpcName, { msg });
+        const requestId: string = collector.collectRequestAndReceivedTime(type, rpcName, { msg, shard });
         try {
-          this.increaseRequest(rpcName, 1);
           await Bluebird.resolve()
             .then(()  => sanitizeAndValidate(parsed, rpcOptions))
-            .tap (req => logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`))
+            .tap (req => logger.debug(`[RPC][REQ] ${rpcName} with ${JSON.stringify(req, null, 2)}`))
             .then(req => this.dohook('pre', type, req))
             .then(req => handler(req))
             .then(res => this.dohook('post', type, res))
             .then(res => sanitizeAndValidateResult(res, rpcOptions))
             .then(res => this.reply(replyTo, res, options))
-            .tap (() => collector.collectExecutedCountAndExecutedTime(type, rpcName, { requestId }))
-            .tap (res => logger.debug(`responses ${JSON.stringify(res)} ${type}, ${rpcName}`))
-            .timeout(RPC_EXEC_TIMEOUT_MS);
+            .tap (res => logger.debug(`[RPC][RESP] ${JSON.stringify(res, null, 2)} ${type}, ${rpcName}`))
+            .timeout(Environments.ISLAND_RPC_EXEC_TIMEOUT_MS);
         } catch (err) {
           await Bluebird.resolve(err)
             .then(err => this.earlyThrowWith503(rpcName, err, msg))
@@ -550,13 +626,12 @@ export default class RPCService {
             .tap (err => this.logRpcError(err));
           throw err;
         } finally {
-          this.increaseRequest(rpcName, -1);
-          if (this.purging && this.onGoingRequest.count < 1) {
+          collector.collectExecutedCountAndExecutedTime(type, rpcName, { requestId });
+          if (this.purging && collector.getOnGoingRequestCount('rpc') < 1) {
             this.purging();
           }
         }
       });
     });
   }
-
 }

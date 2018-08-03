@@ -51,7 +51,7 @@ export class EventSubscriber extends Subscriber {
               private eventClass: new (args: any) => Event<any>) {
     super();
     const event = new eventClass(null);
-    this.key = event.key;
+    this.key = event.key.trim();
   }
 
   getQueue(): string {
@@ -122,4 +122,8 @@ export class PatternSubscriber extends Subscriber {
       .replace('#', '[\\w\\.]*'); // hash(#) means zero or more words, including dot(.)
     return new RegExp(`^${regexPattern}$`);
   }
+}
+
+export interface SubscriptionOptions {
+  everyNodeListen?: boolean;
 }

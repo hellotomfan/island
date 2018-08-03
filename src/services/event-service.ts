@@ -1,18 +1,17 @@
-import * as cls from 'continuation-local-storage';
+import { cls } from 'island-loggers';
 
 import * as amqp from 'amqplib';
 import * as Bluebird from 'bluebird';
+import * as fs from 'fs';
 import * as _ from 'lodash';
 import * as uuid from 'uuid';
 
 import { Environments } from '../utils/environments';
-import { Events } from '../utils/event';
+import { DEFAULT_SUBSCRIPTIONS, Events } from '../utils/event';
 import { logger } from '../utils/logger';
 import reviver from '../utils/reviver';
-import { TraceLog } from '../utils/tracelog';
-
+import { RouteLogger } from '../utils/route-logger';
 import { collector } from '../utils/status-collector';
-
 import { AmqpChannelPoolService } from './amqp-channel-pool-service';
 import {
   BaseEvent,
@@ -21,8 +20,10 @@ import {
   EventSubscriber,
   Message,
   PatternSubscriber,
-  Subscriber
+  Subscriber,
+  SubscriptionOptions
 } from './event-subscriber';
+
 export type EventHook = (obj) => Promise<any>;
 export enum EventHookType {
   EVENT,
@@ -47,6 +48,12 @@ function enterScope(properties: any, func): Promise<any> {
   });
 }
 
+class StatusExport extends BaseEvent<any> {
+  constructor(args: any) {
+    super('island.status.export', args);
+  }
+}
+
 export class EventService {
   private static EXCHANGE_NAME: string = 'MESSAGE_BROKER_EXCHANGE';
   private channelPool: AmqpChannelPoolService;
@@ -56,9 +63,6 @@ export class EventService {
   private subscribers: Subscriber[] = [];
   private serviceName: string;
   private hooks: { [key: string]: EventHook[] } = {};
-  private onGoingRequest: {
-      count: number, details: Map<string, number>
-    } = { count : 0, details : new Map() };
   private purging: Function | null = null;
   private consumerInfosMap: { [name: string]: IEventConsumerInfo } = {};
   private ignoreEventLogRegexp: RegExp | null = null;
@@ -67,20 +71,26 @@ export class EventService {
     this.serviceName = serviceName;
     this.roundRobinQ = `event.${serviceName}`;
     this.fanoutQ = `event.${serviceName}.node.${uuid.v4()}`;
+    fs.writeFileSync('./event.proc', JSON.stringify({ status: 'initializing', queue: this.fanoutQ }));
   }
 
   async initialize(channelPool: AmqpChannelPoolService, consumerChannelPool?: AmqpChannelPoolService): Promise<any> {
-    await TraceLog.initialize();
     this.ignoreEventLogRegexp = (Environments.getIgnoreEventLogRegexp() &&
       new RegExp(Environments.getIgnoreEventLogRegexp(), 'g')) as RegExp;
 
     this.channelPool = channelPool;
     this.consumerChannelPool = consumerChannelPool || channelPool;
-    return this.consumerChannelPool.usingChannel(channel => {
-      return channel.assertExchange(EventService.EXCHANGE_NAME, 'topic', { durable: true })
-        .then(() => channel.assertQueue(this.roundRobinQ, { durable: true, exclusive: false }))
-        .then(() => channel.assertQueue(this.fanoutQ, { exclusive: true, autoDelete: true }));
+    await this.consumerChannelPool.usingChannel(async channel => {
+      await channel.assertExchange(EventService.EXCHANGE_NAME, 'topic', { durable: true });
+      await channel.assertQueue(this.roundRobinQ, { durable: true, exclusive: false });
+      await channel.assertQueue(this.fanoutQ, { exclusive: true, autoDelete: true });
     });
+
+    await Bluebird.map(DEFAULT_SUBSCRIPTIONS, ({ eventClass, handler, options }) => {
+      return this.subscribeEvent(eventClass, handler.bind(this), options);
+    });
+    fs.writeFileSync('./event.proc', JSON.stringify({ status: 'initialized', queue: this.fanoutQ }));
+    collector.registerExporter('EVENT', o => this.sendStatusJsonEvent(o));
   }
 
   async startConsume(): Promise<any> {
@@ -90,30 +100,25 @@ export class EventService {
       this.registerConsumer(channel, queue);
     });
     this.publishEvent(new Events.SystemNodeStarted({ name: this.fanoutQ, island: this.serviceName }));
+    fs.writeFileSync('./event.proc', JSON.stringify({ status: 'started', queue: this.fanoutQ }));
   }
 
   async purge(): Promise<any> {
+    fs.unlinkSync('./event.proc');
     this.hooks = {};
     if (!this.consumerInfosMap) return Promise.resolve();
-    return Promise.all(_.map(this.consumerInfosMap, (consumerInfo: IEventConsumerInfo) => {
+    await Promise.all(_.map(this.consumerInfosMap, (consumerInfo: IEventConsumerInfo) => {
       logger.info(`stop consuming : ${consumerInfo.queue}`);
       return consumerInfo.channel.cancel(consumerInfo.consumerTag);
-    }))
-      .then((): Promise<any> => {
-        this.subscribers = [];
-        if (this.onGoingRequest.count > 0) {
-          return new Promise((res, rej) => { this.purging = res; });
-        }
-        return Promise.resolve();
-      });
+    }));
+    this.subscribers = [];
+    if (collector.getOnGoingRequestCount('event') > 0) {
+      return new Promise((res, rej) => { this.purging = res; });
+    }
   }
 
   public async sigInfo() {
-    logger.info(`Event Service onGoingRequestCount : ${this.onGoingRequest.count}`);
-    await this.onGoingRequest.details.forEach((v, k) => {
-      if (v < 1) return;
-      logger.info(`Event Service ${k} : ${v}`);
-    });
+    return await collector.sigInfo('event');
   }
 
   subscribeEvent<T extends Event<U>, U>(eventClass: new (args: U) => T,
@@ -141,20 +146,16 @@ export class EventService {
       exchange = args[0];
       event = args[1];
     }
-    const ns = cls.getNamespace('app');
-    const tattoo = ns.get('RequestTrackId');
-    const context = ns.get('Context');
-    const type = ns.get('Type');
-    const sessionType = ns.get('sessionType');
-    logger.debug(`publish ${event.key}`, event.args, tattoo);
-    const options = {
-      headers: {
-        tattoo,
-        from: { node: Environments.getHostName(), context, island: this.serviceName, type },
-        extra: { sessionType }
-      },
-      timestamp: +event.publishedAt! || +new Date()
-    };
+
+    const options = this.getOptions(event);
+    RouteLogger.tryToSaveLog(
+      { clsNameSpace: 'app',
+        type: 'req',
+        context: `${event.constructor.name}`,
+        protocol: 'EVENT',
+        correlationId: uuid.v4()
+      });
+    logger.debug(`publish ${event.key}`, JSON.stringify(event.args, null, 2), options.headers.tattoo);
     return Promise.resolve(Bluebird.try(() => new Buffer(JSON.stringify(event.args), 'utf8'))
       .then(content => {
         return this._publish(exchange, event.key, content, options);
@@ -166,6 +167,25 @@ export class EventService {
     this.hooks[type].push(hook);
   }
 
+  private getOptions(event: Event<{}>): any {
+    const ns = cls.getNamespace('app');
+    return {
+      headers: {
+        tattoo: ns.get('RequestTrackId'),
+        from: {
+          node: Environments.getHostName(),
+          context: ns.get('Context'),
+          island: this.serviceName,
+          type: ns.get('Type')
+        },
+        extra: {
+          sessionType: ns.get('sessionType')
+        }
+      },
+      timestamp: +event.publishedAt! || +new Date()
+    };
+  }
+
   private registerConsumer(channel: amqp.Channel, queue: string): Promise<any> {
     const prefetchCount = this.consumerChannelPool.getPrefetchCount();
     return Promise.resolve(channel.prefetch(prefetchCount || Environments.getEventPrefetch()))
@@ -175,18 +195,26 @@ export class EventService {
           // TODO: handle unexpected cancel
           return;
         }
-        const requestId = collector.collectRequestAndReceivedTime('event', msg.fields.routingKey, { msg });
-        this.increaseRequest(msg.fields.routingKey, 1);
+
+        if (msg.fields.routingKey === this.fanoutQ) {
+          msg.fields.routingKey = 'system.diagnosis';
+        }
+
+        let routingKey = msg.fields.routingKey;
+        if (/^cron(\.s)*[\.0-9]*/.test(routingKey)) {
+          routingKey = routingKey.replace(/[\.0-9]*$/, '');
+        }
+
+        const requestId = collector.collectRequestAndReceivedTime('event', routingKey, { msg });
         Bluebird.resolve(this.handleMessage(msg))
-          .tap(() => collector.collectExecutedCountAndExecutedTime('event', msg.fields.routingKey, { requestId }))
           .catch(err => {
             this.sendErrorLog(err, msg);
-            collector.collectExecutedCountAndExecutedTime('event', msg.fields.routingKey, { requestId, err } );
+            collector.collectExecutedCountAndExecutedTime('event', routingKey, { requestId, err } );
           })
           .finally(() => {
             channel.ack(msg);
-            this.increaseRequest(msg.fields.routingKey, -1);
-            if (this.purging && this.onGoingRequest.count < 1 ) {
+            collector.collectExecutedCountAndExecutedTime('event', routingKey, { requestId });
+            if (this.purging && collector.getOnGoingRequestCount('event') < 1 ) {
               this.purging();
             }
             // todo: fix me. we're doing ACK always even if promise rejected.
@@ -238,19 +266,7 @@ export class EventService {
         if (!this.ignoreEventLogRegexp || !msg.fields.routingKey.match(this.ignoreEventLogRegexp)) {
           logger.debug(`subscribe event : ${msg.fields.routingKey}`, content, msg.properties.headers);
         }
-        const log = new TraceLog(tattoo, msg.properties.timestamp || 0);
-        log.size = msg.content.byteLength;
-        log.from = headers.from;
-        log.to = {
-          context: msg.fields.routingKey,
-          island: this.serviceName,
-          node: Environments.getHostName()!,
-          type: 'event'
-        };
         return Bluebird.resolve(subscriber.handleEvent(content, msg))
-          .then(() => {
-            log.end();
-          })
           .catch(async e => {
             if (!e.extra || typeof e.extra === 'object') {
               e.extra = _.assign({
@@ -259,12 +275,7 @@ export class EventService {
                 island: this.serviceName
               }, e.extra);
             }
-            e = await this.dohook(EventHookType.ERROR, e);
-            log.end(e);
-            throw e;
-          })
-          .finally(() => {
-            log.shoot();
+            throw await this.dohook(EventHookType.ERROR, e);
           });
       });
     });
@@ -288,13 +299,7 @@ export class EventService {
     });
   }
 
-  private increaseRequest(name: string, count: number) {
-    this.onGoingRequest.count += count;
-    const requestCount = (this.onGoingRequest.details.get(name) || 0) + count;
-    this.onGoingRequest.details.set(name, requestCount);
+  private sendStatusJsonEvent(data: any) {
+    return this.publishEvent(new StatusExport(data));
   }
-}
-
-export interface SubscriptionOptions {
-  everyNodeListen?: boolean;
 }
